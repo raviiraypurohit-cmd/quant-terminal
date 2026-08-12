@@ -1,11 +1,13 @@
 # ==============================================================================
-# 🇮🇳 INSTITUTIONAL QUANTITATIVE TRADING TERMINAL v8.0 (Cloud Edition)
-# Features: Mobile Responsive, Cloud-Ready (0.0.0.0 Bind), Theme Toggle
+# 📈 INSTITUTIONAL QUANTITATIVE TRADING TERMINAL v9.0 (Cloud Edition)
+# Author: Ravi Ray Purohit
+# Features: Dynamic Search, Exchange Filter, Lightweight Live Charts, No N/A, Currency Auto-Detect
 # ==============================================================================
 
 import sys
 import time
 import math
+import json
 import traceback
 import os
 import http.server
@@ -26,6 +28,11 @@ class Config:
     CACHE_EXPIRY = 300
     TF_MAPPING = {"1mo": 22, "3mo": 65, "6mo": 130, "1y": 252, "2y": 504, "5y": 1260, "max": 5000}
 
+CURRENCY_SYMBOLS = {
+    "INR": "₹", "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥",
+    "CAD": "C$", "AUD": "A$", "CHF": "CHF ", "CNY": "¥", "HKD": "HK$"
+}
+
 class Utils:
     @staticmethod
     def safe_div(numerator, denominator, fallback=0.0):
@@ -40,18 +47,22 @@ class Utils:
         except: return fallback
 
     @staticmethod
-    def fmt(val, is_curr=True, is_pct=False, crores=False):
-        if val is None or pd.isna(val) or val == float('inf') or val == float('-inf') or val == 0 or val == "N/A": return "N/A"
+    def fmt(val, is_curr=True, is_pct=False, crores=False, curr_code="INR"):
+        sym = CURRENCY_SYMBOLS.get(curr_code, "$") if is_curr else ""
+        if val is None or pd.isna(val) or val == float('inf') or val == float('-inf') or val == "N/A" or val == "—":
+            return "—"
         try:
             val = float(val)
+            if val == 0 and not is_pct: return "—"
             if is_pct: return f"{val*100:+.2f}%" if abs(val) < 1.5 else f"{val:+.2f}%"
-            if crores: return f"₹{val/10000000:,.2f} Cr"
-            if is_curr: return f"₹{val:,.2f}" if val > 1 else f"${val:,.2f}"
+            if crores and curr_code == "INR": return f"₹{val/10000000:,.2f} Cr"
+            if crores and curr_code != "INR": return f"{sym}{val/1000000000:,.2f} B"
+            if is_curr: return f"{sym}{val:,.2f}"
             return f"{val:,.2f}"
-        except: return str(val)
+        except: return str(val) if val else "—"
 
 # ==============================================================================
-# DATA ENGINE (WITH CRUMB MANAGER)
+# DATA ENGINE
 # ==============================================================================
 class DataEngine:
     _cache = {}
@@ -68,6 +79,63 @@ class DataEngine:
             if res.status_code == 200: crumb = res.text.strip()
         except: pass
         return session, crumb
+
+    @classmethod
+    def search_symbols(cls, query, market="ALL"):
+        if not query or len(query) < 2: return []
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}&quotesCount=15&newsCount=0&listsCount=0"
+        try:
+            res = session.get(url, timeout=4)
+            if res.status_code != 200: return []
+            quotes = res.json().get('quotes', [])
+            results = []
+            for item in quotes:
+                quote_type = item.get('quoteType', '')
+                if quote_type not in ['EQUITY', 'MUTUALFUND', 'ETF']: continue
+                
+                symbol = item.get('symbol', '')
+                shortname = item.get('shortname') or item.get('longname') or symbol
+                exchange = item.get('exchDisp') or item.get('exchange', '')
+
+                # Market Filtering
+                if market == "NSE" and not (symbol.endswith('.NS') or exchange.upper() == 'NSE'): continue
+                elif market == "BSE" and not (symbol.endswith('.BO') or exchange.upper() == 'BSE'): continue
+                elif market == "US" and not (exchange.upper() in ['NASDAQ', 'NYSE', 'NYQ', 'NYS', 'NCM', 'NGS'] or ('.' not in symbol and not symbol.endswith('.NS') and not symbol.endswith('.BO'))): continue
+                elif market == "LSE" and not (symbol.endswith('.L') or exchange.upper() == 'LSE'): continue
+
+                results.append({"symbol": symbol, "name": shortname, "exchange": exchange})
+            return results[:8]
+        except Exception: return []
+
+    @classmethod
+    def fetch_intraday(cls, symbol):
+        if not symbol: return []
+        session, crumb = cls.get_session_and_crumb(symbol)
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=5m"
+        if crumb: url += f"&crumb={crumb}"
+        try:
+            res = session.get(url, timeout=4)
+            if res.status_code != 200: return []
+            data = res.json()['chart']['result'][0]
+            timestamps = data.get('timestamp', [])
+            quote = data['indicators']['quote'][0]
+            opens, highs, lows, closes, vols = quote.get('open', []), quote.get('high', []), quote.get('low', []), quote.get('close', []), quote.get('volume', [])
+
+            candles = []
+            for i in range(len(timestamps)):
+                if opens[i] is not None and closes[i] is not None:
+                    candles.append({
+                        "time": int(timestamps[i]),
+                        "open": float(opens[i]),
+                        "high": float(highs[i]),
+                        "low": float(lows[i]),
+                        "close": float(closes[i]),
+                        "volume": float(vols[i] or 0)
+                    })
+            return candles
+        except Exception: return []
 
     @classmethod
     def direct_api_fallback(cls, symbol, period):
@@ -89,6 +157,7 @@ class DataEngine:
         data = res.json()
         result = data['chart']['result'][0]
         quote = result['indicators']['quote'][0]
+        meta = result.get('meta', {})
         
         df = pd.DataFrame({
             'Open': quote.get('open', []), 'High': quote.get('high', []),
@@ -98,16 +167,17 @@ class DataEngine:
         df.index = pd.to_datetime(result['timestamp'], unit='s')
         df.dropna(inplace=True)
         
-        info = {'longName': symbol}
+        info = {'longName': symbol, 'currency': meta.get('currency', 'INR')}
         try:
             quote_url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
             if crumb: quote_url += f"&crumb={crumb}"
             q_res = session.get(quote_url).json()['quoteResponse']['result'][0]
             info.update({
-                'longName': q_res.get('longName', symbol), 'exchange': q_res.get('fullExchangeName', 'N/A'),
+                'longName': q_res.get('longName', symbol), 'exchange': q_res.get('fullExchangeName', 'NSE'),
                 'marketCap': q_res.get('marketCap', 0), 'fiftyTwoWeekHigh': q_res.get('fiftyTwoWeekHigh', 0),
                 'fiftyTwoWeekLow': q_res.get('fiftyTwoWeekLow', 0), 'trailingPE': q_res.get('trailingPE', 0),
-                'dividendYield': q_res.get('trailingAnnualDividendYield', 0), 'currentPrice': q_res.get('regularMarketPrice', df['Close'].iloc[-1])
+                'dividendYield': q_res.get('trailingAnnualDividendYield', 0), 'currentPrice': q_res.get('regularMarketPrice', df['Close'].iloc[-1]),
+                'currency': q_res.get('currency', meta.get('currency', 'INR'))
             })
         except: pass
             
@@ -125,7 +195,6 @@ class DataEngine:
                 'targetMeanPrice': fd.get('targetMeanPrice', {}).get('raw', None),
                 'recommendationKey': fd.get('recommendationKey', 'N/A')
             })
-            
             mhb = sum_res.get('majorHoldersBreakdown', {})
             info['heldPercentInsiders'] = mhb.get('insidersPercentHeld', {}).get('raw', None)
             info['heldPercentInstitutions'] = mhb.get('institutionsPercentHeld', {}).get('raw', None)
@@ -163,12 +232,13 @@ class DataEngine:
                 except: info = {}
                 info['currentPrice'] = getattr(fast, 'lastPrice', info.get('currentPrice', df['Close'].iloc[-1]))
                 info['marketCap'] = getattr(fast, 'marketCap', info.get('marketCap', 0))
+                info['currency'] = getattr(fast, 'currency', info.get('currency', 'INR'))
         except: pass 
 
         if df is None or df.empty:
             df, info, symbol_clean = cls.direct_api_fallback(symbol_clean, fetch_period)
 
-        if df.empty: raise ValueError(f"Ticker '{symbol}' not found. Check spelling.")
+        if df.empty: raise ValueError(f"Ticker '{symbol}' not found or blocked. Please check spelling.")
 
         df.index = pd.to_datetime(df.index)
         if df.index.tz is not None: df.index = df.index.tz_localize(None)
@@ -179,6 +249,10 @@ class DataEngine:
 
         df = df.ffill().bfill()
         if 'currentPrice' not in info or not info['currentPrice']: info['currentPrice'] = df['Close'].iloc[-1]
+        
+        # Fallback Calculation for Market Cap if missing
+        if not info.get('marketCap') and info.get('sharesOutstanding'):
+            info['marketCap'] = info['currentPrice'] * info['sharesOutstanding']
 
         raw_data = {"symbol": symbol_clean, "df": df, "info": info, "fast": {}}
         cls._cache[cache_key] = (raw_data, time.time())
@@ -313,7 +387,7 @@ class VerdictEngine:
         }
 
 # ==============================================================================
-# UI HTML ENGINE (MOBILE RESPONSIVE CSS INJECTED)
+# UI HTML ENGINE
 # ==============================================================================
 class UIEngine:
     CSS = """
@@ -334,11 +408,18 @@ class UIEngine:
         
         .brand-header { background: var(--brand-bg); color: var(--brand-text); text-align: center; padding: 12px; font-size: 16px; font-weight: 800; letter-spacing: 1.5px; box-shadow: 0 2px 10px rgba(0,0,0,0.2); }
         .nav-bar { background: var(--bg-nav); padding: 15px; border-bottom: 2px solid var(--border); display: flex; gap: 10px; justify-content: center; align-items: center; position: sticky; top: 0; z-index: 1000; flex-wrap: wrap;}
-        .nav-bar input, .nav-bar select { padding: 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-metric); color: var(--text-main); font-size: 14px; outline: none; }
-        .nav-bar input { flex: 1; max-width: 250px; min-width: 150px; }
+        
+        .search-wrapper { position: relative; flex: 1; max-width: 320px; min-width: 180px; }
+        .nav-bar input, .nav-bar select { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-metric); color: var(--text-main); font-size: 14px; outline: none; }
         .nav-bar button.action-btn { padding: 10px 20px; border-radius: 6px; border: none; background: #00f2fe; color: #0b0e14; font-size: 14px; font-weight: bold; cursor: pointer; }
         .nav-bar button.theme-btn { padding: 10px 15px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-metric); color: var(--text-main); font-size: 16px; cursor: pointer; }
         
+        .suggestions-box { position: absolute; top: 105%; left: 0; right: 0; background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; max-height: 280px; overflow-y: auto; z-index: 2000; box-shadow: 0 8px 16px rgba(0,0,0,0.4); display: none; }
+        .suggestion-item { padding: 10px; cursor: pointer; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
+        .suggestion-item:hover { background: var(--bg-metric); }
+        .suggestion-symbol { font-weight: bold; color: var(--accent); }
+        .suggestion-name { color: var(--text-muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px; }
+
         .flex-container { display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 15px; }
         .flex-item { flex: 1 1 300px; }
         .flex-large { flex: 2 1 600px; }
@@ -359,15 +440,15 @@ class UIEngine:
         .quant-table th { background: var(--bg-metric); color: var(--text-muted); text-align: left; padding: 10px; border-bottom: 1px solid var(--border);}
         .quant-table td { padding: 10px; border-bottom: 1px solid var(--border); }
         
-        /* Mobile Specific Overrides */
         @media (max-width: 600px) {
             .header-bar { flex-direction: column; align-items: flex-start; }
             .header-bar > div { width: 100%; }
             .nav-bar { padding: 10px; }
-            .nav-bar input { max-width: 100%; }
+            .search-wrapper { max-width: 100%; }
             .metric-grid { grid-template-columns: 1fr 1fr; }
         }
     </style>
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <script>
         function toggleTheme() {
             const body = document.documentElement;
@@ -381,18 +462,67 @@ class UIEngine:
             const savedTheme = localStorage.getItem('theme') || 'dark';
             document.documentElement.setAttribute('data-theme', savedTheme);
         });
+
+        let debounceTimer;
+        function handleSearchInput(input) {
+            clearTimeout(debounceTimer);
+            const query = input.value.trim();
+            const market = document.getElementById('marketFilter').value;
+            const box = document.getElementById('searchSuggestions');
+            
+            if (query.length < 2) { box.style.display = 'none'; return; }
+
+            debounceTimer = setTimeout(async () => {
+                try {
+                    const res = await fetch(`/api/search?q=${encodeURIComponent(query)}&market=${market}`);
+                    const items = await res.json();
+                    if (items.length === 0) { box.style.display = 'none'; return; }
+                    box.innerHTML = items.map(item => `
+                        <div class="suggestion-item" onclick="selectSuggestion('${item.symbol}')">
+                            <div>
+                                <div class="suggestion-symbol">${item.symbol}</div>
+                                <div class="suggestion-name">${item.name}</div>
+                            </div>
+                            <span style="font-size:10px; color:var(--text-muted); padding:2px 6px; background:var(--bg-metric); border-radius:4px;">${item.exchange}</span>
+                        </div>
+                    `).join('');
+                    box.style.display = 'block';
+                } catch(e) { console.error(e); }
+            }, 250);
+        }
+
+        function selectSuggestion(symbol) {
+            document.getElementById('tickerInput').value = symbol;
+            document.getElementById('searchSuggestions').style.display = 'none';
+            document.getElementById('searchForm').submit();
+        }
+
+        document.addEventListener('click', (e) => {
+            if (!e.target.closest('.search-wrapper')) {
+                const box = document.getElementById('searchSuggestions');
+                if(box) box.style.display = 'none';
+            }
+        });
     </script>
     """
 
     @classmethod
-    def build_nav_bar(cls, current_ticker="", current_tf="1y"):
+    def build_nav_bar(cls, current_ticker="", current_tf="1y", current_market="ALL"):
         tfs = ["1mo", "3mo", "6mo", "1y", "2y", "5y", "max"]
-        options = "".join([f'<option value="{tf}" {"selected" if tf == current_tf else ""}>{tf}</option>' for tf in tfs])
+        tf_options = "".join([f'<option value="{tf}" {"selected" if tf == current_tf else ""}>{tf}</option>' for tf in tfs])
+        
+        markets = [("ALL", "🌍 All Equities"), ("NSE", "🇮🇳 India - NSE"), ("BSE", "🇮🇳 India - BSE"), ("US", "🇺🇸 US Markets"), ("LSE", "🇬🇧 UK - LSE")]
+        mkt_options = "".join([f'<option value="{m[0]}" {"selected" if m[0] == current_market else ""}>{m[1]}</option>' for m in markets])
+
         return f"""
         <div class="brand-header">BY RAVI RAY PUROHIT</div>
-        <form class="nav-bar" method="GET" action="/">
-            <input type="text" name="ticker" placeholder="Ticker (e.g. RELIANCE)" value="{current_ticker}" required>
-            <select name="tf">{options}</select>
+        <form class="nav-bar" id="searchForm" method="GET" action="/">
+            <select name="market" id="marketFilter" style="width: auto; min-width: 140px;">{mkt_options}</select>
+            <div class="search-wrapper">
+                <input type="text" id="tickerInput" name="ticker" placeholder="Search Company or Ticker..." value="{current_ticker}" oninput="handleSearchInput(this)" autocomplete="off" required>
+                <div id="searchSuggestions" class="suggestions-box"></div>
+            </div>
+            <select name="tf" style="width: auto;">{tf_options}</select>
             <button type="submit" class="action-btn">Analyze</button>
             <button type="button" class="theme-btn" onclick="toggleTheme()" title="Toggle Theme">🌓</button>
         </form>
@@ -403,7 +533,7 @@ class UIEngine:
         return f"""
         <!DOCTYPE html><html lang="en" data-theme="dark"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Quant Dashboard by Ravi Ray Purohit</title>{cls.CSS}</head>
         <body>{cls.build_nav_bar()}
-        <div class="container"><div style="text-align:center; padding: 50px; color:var(--text-muted);"><h2>📈 Terminal Ready</h2><p>Enter a ticker symbol above to pull live market data.</p></div></div>
+        <div class="container"><div style="text-align:center; padding: 60px; color:var(--text-muted);"><h2>📈 Quant Terminal Ready</h2><p>Select a market and search for any stock company or symbol above.</p></div></div>
         </body></html>
         """
 
@@ -418,26 +548,74 @@ class UIEngine:
 
     @classmethod
     def build_live_chart(cls, symbol):
-        tv_sym = symbol
-        if symbol.endswith(".NS") or symbol.endswith(".BO"):
-            tv_sym = f"BSE:{symbol.replace('.NS', '').replace('.BO', '')}"
-            
         return f"""
         <div class="card">
-            <div class="section-title">🔴 LIVE REAL-TIME CHART</div>
-            <div class="tradingview-widget-container" style="height: 450px; width: 100%;">
-              <div id="tv_chart" style="height: 100%; width: 100%;"></div>
-              <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-              <script type="text/javascript">
-                function renderTVChart() {{
-                    let theme = document.documentElement.getAttribute('data-theme') || 'dark';
-                    document.getElementById('tv_chart').innerHTML = ""; 
-                    new TradingView.widget({{"autosize": true,"symbol": "{tv_sym}","interval": "5","timezone": "Asia/Kolkata","theme": theme,"style": "1","locale": "en","enable_publishing": false,"backgroundColor": theme === 'light' ? "#ffffff" : "#151924","gridColor": theme === 'light' ? "#e0e4eb" : "#232733","hide_top_toolbar": false,"save_image": false,"container_id": "tv_chart"}});
+            <div class="section-title">🔴 LIVE INTRADAY REAL-TIME CHART (AUTO-POLLING)</div>
+            <div id="lightweight_chart" style="height: 450px; width: 100%;"></div>
+            <script type="text/javascript">
+                let chart, candleSeries, volumeSeries;
+                const currentSymbol = "{symbol}";
+
+                function initLightweightChart() {{
+                    const chartContainer = document.getElementById('lightweight_chart');
+                    if(!chartContainer) return;
+                    chartContainer.innerHTML = '';
+                    
+                    const isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+                    
+                    chart = LightweightCharts.createChart(chartContainer, {{
+                        width: chartContainer.clientWidth,
+                        height: 450,
+                        layout: {{
+                            background: {{ color: isDark ? '#151924' : '#ffffff' }},
+                            textColor: isDark ? '#e1e4ea' : '#1a1d20',
+                        }},
+                        grid: {{
+                            vertLines: {{ color: isDark ? '#232733' : '#e0e4eb' }},
+                            horzLines: {{ color: isDark ? '#232733' : '#e0e4eb' }},
+                        }},
+                        timeScale: {{ timeVisible: true, secondsVisible: false }},
+                    }});
+                    
+                    candleSeries = chart.addCandlestickSeries({{
+                        upColor: '#00c853', downColor: '#ff5252',
+                        borderUpColor: '#00c853', borderDownColor: '#ff5252',
+                        wickUpColor: '#00c853', wickDownColor: '#ff5252',
+                    }});
+                    
+                    volumeSeries = chart.addHistogramSeries({{
+                        color: '#26a69a',
+                        priceFormat: {{ type: 'volume' }},
+                        priceScaleId: '',
+                        scaleMargins: {{ top: 0.8, bottom: 0 }},
+                    }});
+
+                    loadIntradayData();
                 }}
-                document.addEventListener('DOMContentLoaded', renderTVChart);
-                window.addEventListener('themeChanged', renderTVChart);
-              </script>
-            </div>
+
+                async function loadIntradayData() {{
+                    try {{
+                        const res = await fetch(`/api/intraday?symbol=${{encodeURIComponent(currentSymbol)}}`);
+                        const data = await res.json();
+                        if(data && data.length > 0) {{
+                            candleSeries.setData(data);
+                            const volData = data.map(d => ({{
+                                time: d.time,
+                                value: d.volume,
+                                color: d.close >= d.open ? 'rgba(0, 200, 83, 0.4)' : 'rgba(255, 82, 82, 0.4)'
+                            }}));
+                            volumeSeries.setData(volData);
+                        }}
+                    }} catch(e) {{ console.error('Intraday chart error', e); }}
+                }}
+
+                document.addEventListener('DOMContentLoaded', initLightweightChart);
+                window.addEventListener('themeChanged', initLightweightChart);
+                setInterval(loadIntradayData, 8000); // Live poll every 8 seconds
+                window.addEventListener('resize', () => {{
+                    if(chart) chart.applyOptions({{ width: document.getElementById('lightweight_chart').clientWidth }});
+                }});
+            </script>
         </div>
         """
 
@@ -445,6 +623,8 @@ class UIEngine:
     def build_header(cls, info, latest, prev, symbol):
         curr_price, prev_close = latest['Close'], prev['Close']
         change_pct = Utils.safe_div(curr_price - prev_close, prev_close) * 100
+        curr_code = info.get('currency', 'INR')
+        
         return f"""
         <div class="card">
             <div class="header-bar">
@@ -453,24 +633,24 @@ class UIEngine:
                     <span style="color:var(--text-muted); font-size:12px;">{info.get('exchange', 'NSE')} | {info.get('sector', 'N/A')}</span>
                 </div>
                 <div style="text-align: right;">
-                    <div style="font-size: 28px; font-weight: 700;">{Utils.fmt(curr_price)}</div>
+                    <div style="font-size: 28px; font-weight: 700;">{Utils.fmt(curr_price, curr_code=curr_code)}</div>
                     <span class="{ 'badge-pos' if change_pct >= 0 else 'badge-neg' }">{change_pct:+.2f}% ({curr_price - prev_close:+.2f})</span>
                 </div>
             </div>
             <div class="metric-grid">
-                <div class="metric-item"><div class="metric-label">Prev Close</div><div class="metric-value">{Utils.fmt(prev_close)}</div></div>
-                <div class="metric-item"><div class="metric-label">Day Range</div><div class="metric-value">{Utils.fmt(latest['Low'])} - {Utils.fmt(latest['High'])}</div></div>
-                <div class="metric-item"><div class="metric-label">52W High</div><div class="metric-value">{Utils.fmt(info.get('fiftyTwoWeekHigh'))}</div></div>
-                <div class="metric-item"><div class="metric-label">Market Cap</div><div class="metric-value">{Utils.fmt(info.get('marketCap'), crores=True)}</div></div>
-                <div class="metric-item"><div class="metric-label">Trailing P/E</div><div class="metric-value">{Utils.fmt(info.get('trailingPE'), False)}</div></div>
-                <div class="metric-item"><div class="metric-label">Div Yield</div><div class="metric-value">{Utils.fmt(info.get('dividendYield', 0)*100, False)}%</div></div>
-                <div class="metric-item"><div class="metric-label">Avg Volume</div><div class="metric-value">{info.get('averageVolume', 0):,}</div></div>
+                <div class="metric-item"><div class="metric-label">Prev Close</div><div class="metric-value">{Utils.fmt(prev_close, curr_code=curr_code)}</div></div>
+                <div class="metric-item"><div class="metric-label">Day Range</div><div class="metric-value">{Utils.fmt(latest['Low'], curr_code=curr_code)} - {Utils.fmt(latest['High'], curr_code=curr_code)}</div></div>
+                <div class="metric-item"><div class="metric-label">52W High</div><div class="metric-value">{Utils.fmt(info.get('fiftyTwoWeekHigh'), curr_code=curr_code)}</div></div>
+                <div class="metric-item"><div class="metric-label">Market Cap</div><div class="metric-value">{Utils.fmt(info.get('marketCap'), crores=True, curr_code=curr_code)}</div></div>
+                <div class="metric-item"><div class="metric-label">Trailing P/E</div><div class="metric-value">{Utils.fmt(info.get('trailingPE'), False, curr_code=curr_code)}</div></div>
+                <div class="metric-item"><div class="metric-label">Div Yield</div><div class="metric-value">{Utils.fmt(info.get('dividendYield'), is_pct=True, curr_code=curr_code)}</div></div>
+                <div class="metric-item"><div class="metric-label">Avg Volume</div><div class="metric-value">{Utils.fmt(info.get('averageVolume'), False, curr_code=curr_code)}</div></div>
             </div>
         </div>
         """
 
     @classmethod
-    def build_verdict(cls, verdict):
+    def build_verdict(cls, verdict, curr_code="INR"):
         return f"""
         <div class="card flex-item" style="border-top: 4px solid {verdict['color']}; text-align:center;">
             <div class="section-title" style="text-align:left;">AI VERDICT ENGINE</div>
@@ -483,15 +663,15 @@ class UIEngine:
             </div>
             <div style="text-align: left; margin-top: 15px; border-top: 1px solid var(--border); padding-top: 10px;">
                 <div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">ATR TRADE SETUP</div>
-                <div style="font-size:12px; display:flex; justify-content:space-between; margin-bottom:3px;"><span>Entry:</span> <strong>{Utils.fmt(verdict['entry'])}</strong></div>
-                <div style="font-size:12px; display:flex; justify-content:space-between; margin-bottom:3px;"><span>Stop Loss:</span> <strong style="color:#ff5252;">{Utils.fmt(verdict['stop_loss'])}</strong></div>
-                <div style="font-size:12px; display:flex; justify-content:space-between;"><span>Target:</span> <strong style="color:#00c853;">{Utils.fmt(verdict['target1'])}</strong></div>
+                <div style="font-size:12px; display:flex; justify-content:space-between; margin-bottom:3px;"><span>Entry:</span> <strong>{Utils.fmt(verdict['entry'], curr_code=curr_code)}</strong></div>
+                <div style="font-size:12px; display:flex; justify-content:space-between; margin-bottom:3px;"><span>Stop Loss:</span> <strong style="color:#ff5252;">{Utils.fmt(verdict['stop_loss'], curr_code=curr_code)}</strong></div>
+                <div style="font-size:12px; display:flex; justify-content:space-between;"><span>Target:</span> <strong style="color:#00c853;">{Utils.fmt(verdict['target1'], curr_code=curr_code)}</strong></div>
             </div>
         </div>
         """
 
     @classmethod
-    def build_tech_panel(cls, latest):
+    def build_tech_panel(cls, latest, curr_code="INR"):
         return f"""
         <div class="card flex-large">
             <div class="section-title">TECHNICAL & MOMENTUM BREAKDOWN</div>
@@ -500,9 +680,9 @@ class UIEngine:
                 <div class="metric-item"><div class="metric-label">MACD</div><div class="metric-value">{Utils.fmt(latest['MACD'], False)}</div></div>
                 <div class="metric-item"><div class="metric-label">Stoch %K</div><div class="metric-value">{Utils.fmt(latest['Stoch_RSI_K'], False)}</div></div>
                 <div class="metric-item"><div class="metric-label">ADX</div><div class="metric-value">{Utils.fmt(latest['ADX'], False)}</div></div>
-                <div class="metric-item"><div class="metric-label">ATR (14)</div><div class="metric-value">{Utils.fmt(latest['ATR'])}</div></div>
+                <div class="metric-item"><div class="metric-label">ATR (14)</div><div class="metric-value">{Utils.fmt(latest['ATR'], curr_code=curr_code)}</div></div>
                 <div class="metric-item"><div class="metric-label">CMF</div><div class="metric-value">{Utils.fmt(latest['CMF'], False)}</div></div>
-                <div class="metric-item"><div class="metric-label">Volume</div><div class="metric-value">{latest['Volume']:,}</div></div>
+                <div class="metric-item"><div class="metric-label">Volume</div><div class="metric-value">{Utils.fmt(latest['Volume'], False)}</div></div>
                 <div class="metric-item"><div class="metric-label">Vol Ratio</div><div class="metric-value">{Utils.safe_div(latest['Volume'], latest['Vol_20SMA']):.2f}x</div></div>
             </div>
         </div>
@@ -510,6 +690,7 @@ class UIEngine:
 
     @classmethod
     def build_funds(cls, info):
+        curr_code = info.get('currency', 'INR')
         return f"""
         <div class="flex-container">
             <div class="card flex-item">
@@ -527,8 +708,8 @@ class UIEngine:
                 <div class="section-title">ANALYST CONSENSUS & SHAREHOLDING</div>
                 <div class="table-responsive">
                     <table class="quant-table">
-                        <tr><td>Consensus Rec</td><td><strong style="color:var(--accent);">{str(info.get('recommendationKey', 'N/A')).upper()}</strong></td></tr>
-                        <tr><td>Mean Target</td><td><strong>{Utils.fmt(info.get('targetMeanPrice'))}</strong></td></tr>
+                        <tr><td>Consensus Rec</td><td><strong style="color:var(--accent);">{str(info.get('recommendationKey', '—')).upper()}</strong></td></tr>
+                        <tr><td>Mean Target</td><td><strong>{Utils.fmt(info.get('targetMeanPrice'), curr_code=curr_code)}</strong></td></tr>
                         <tr><td>Insiders Holding</td><td><strong>{Utils.fmt(info.get('heldPercentInsiders'), is_pct=True)}</strong></td></tr>
                         <tr><td>Institutions Holding</td><td><strong>{Utils.fmt(info.get('heldPercentInstitutions'), is_pct=True)}</strong></td></tr>
                     </table>
@@ -562,11 +743,37 @@ class UIEngine:
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed_url = urlparse(self.path)
-        
-        if parsed_url.path == "/" or parsed_url.path == "/index.html":
-            query_params = parse_qs(parsed_url.query)
+        path = parsed_url.path
+        query_params = parse_qs(parsed_url.query)
+
+        # 1. API SEARCH ROUTE
+        if path == "/api/search":
+            q = query_params.get('q', [''])[0].strip()
+            market = query_params.get('market', ['ALL'])[0].strip()
+            results = DataEngine.search_symbols(q, market)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(results).encode("utf-8"))
+            return
+
+        # 2. API INTRADAY CHART ROUTE
+        elif path == "/api/intraday":
+            symbol = query_params.get('symbol', [''])[0].strip()
+            candles = DataEngine.fetch_intraday(symbol)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(candles).encode("utf-8"))
+            return
+
+        # 3. HTML DASHBOARD PAGE
+        elif path == "/" or path == "/index.html":
             ticker = query_params.get('ticker', [''])[0].strip().upper()
             tf = query_params.get('tf', ['1y'])[0]
+            market = query_params.get('market', ['ALL'])[0]
 
             if not ticker: html = UIEngine.build_landing_page()
             else:
@@ -575,16 +782,17 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     df, info = data['df'], data['info']
                     latest, prev = df.iloc[-1], df.iloc[-2]
                     verdict = VerdictEngine.evaluate(df, info)
+                    curr_code = info.get('currency', 'INR')
 
                     header_html = UIEngine.build_header(info, latest, prev, data['symbol'])
                     live_chart_html = UIEngine.build_live_chart(data['symbol'])
-                    verdict_html = UIEngine.build_verdict(verdict)
-                    tech_html = UIEngine.build_tech_panel(latest)
+                    verdict_html = UIEngine.build_verdict(verdict, curr_code=curr_code)
+                    tech_html = UIEngine.build_tech_panel(latest, curr_code=curr_code)
                     plot_html = UIEngine.render_plot_html(df, data['symbol'])
                     funds_html = UIEngine.build_funds(info)
 
                     recent_df = df.dropna(subset=['Close', 'Volume']).tail(5).iloc[::-1]
-                    table_rows = "".join([f"<tr><td>{idx.strftime('%Y-%m-%d')}</td><td>{Utils.fmt(r['Open'])}</td><td>{Utils.fmt(r['High'])}</td><td>{Utils.fmt(r['Low'])}</td><td>{Utils.fmt(r['Close'])}</td><td>{int(r['Volume']):,}</td><td>{Utils.fmt(r['RSI'], False)}</td><td>{Utils.fmt(r['MACD'], False)}</td></tr>" for idx, r in recent_df.iterrows()])
+                    table_rows = "".join([f"<tr><td>{idx.strftime('%Y-%m-%d')}</td><td>{Utils.fmt(r['Open'], curr_code=curr_code)}</td><td>{Utils.fmt(r['High'], curr_code=curr_code)}</td><td>{Utils.fmt(r['Low'], curr_code=curr_code)}</td><td>{Utils.fmt(r['Close'], curr_code=curr_code)}</td><td>{int(r['Volume']):,}</td><td>{Utils.fmt(r['RSI'], False)}</td><td>{Utils.fmt(r['MACD'], False)}</td></tr>" for idx, r in recent_df.iterrows()])
                     
                     ohlcv_html = f"""
                     <div class="card">
@@ -600,7 +808,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
                     html = f"""
                     <!DOCTYPE html><html lang="en" data-theme="dark"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{data['symbol']} Quant Dashboard</title>{UIEngine.CSS}</head>
-                    <body>{UIEngine.build_nav_bar(ticker, tf)}
+                    <body>{UIEngine.build_nav_bar(ticker, tf, market)}
                         <div class="container">
                             {header_html}{live_chart_html} 
                             <div class="flex-container">{verdict_html}{tech_html}</div>
@@ -626,11 +834,9 @@ class ReusableTCPServer(socketserver.TCPServer):
     allow_reuse_address = True
 
 if __name__ == "__main__":
-    # DYNAMIC PORT: Render will inject its own port here.
     PORT = int(os.environ.get("PORT", 8050))
     print(f"Starting server on port {PORT}...")
     try:
-        # BIND TO 0.0.0.0: Allows the cloud service to expose your app to the public internet.
         with ReusableTCPServer(("0.0.0.0", PORT), DashboardHandler) as httpd:
             httpd.serve_forever()
     except Exception as e:
