@@ -1,4 +1,8 @@
 pandas
-yfinance==0.2.37
+numpy
+yfinance
 plotly
 requests
+requests-cache
+lxml
+beautifulsoup4
