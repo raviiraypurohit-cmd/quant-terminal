@@ -1,4 +1,4 @@
-# 📈 Institutional Quantitative Trading Terminal (v8.0)
+# 📈 Institutional Quantitative Trading Terminal (v9.0)
 **By Ravi Ray Purohit**
 
 A robust, cloud-ready, and mobile-responsive web application designed for quantitative stock analysis. This terminal fetches institutional-grade fundamental data, advanced technical indicators, and real-time live charts for both Indian (NSE/BSE) and US markets—all presented in a beautiful, zero-lag web interface.
