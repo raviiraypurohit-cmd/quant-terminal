@@ -1,7 +1,8 @@
 # ==============================================================================
-# 📈 INSTITUTIONAL QUANTITATIVE TRADING TERMINAL v9.0 (Cloud Edition)
+# 📈 INSTITUTIONAL QUANTITATIVE TRADING TERMINAL v9.1 (Cloud Edition)
 # Author: Ravi Ray Purohit
-# Features: Dynamic Search, Exchange Filter, Lightweight Live Charts, No N/A, Currency Auto-Detect
+# Features: Dynamic Search, Exchange Filter, Lightweight Live Charts, 
+#           Force Fundamental Fallback, Currency Auto-Detect
 # ==============================================================================
 
 import sys
@@ -70,11 +71,16 @@ class DataEngine:
     @classmethod
     def get_session_and_crumb(cls, symbol):
         session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        })
         crumb = ""
         try:
             try: session.get("https://fc.yahoo.com", timeout=3)
             except: session.get(f"https://finance.yahoo.com/quote/{symbol}", timeout=3)
+            
             res = session.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=3)
             if res.status_code == 200: crumb = res.text.strip()
         except: pass
@@ -99,7 +105,6 @@ class DataEngine:
                 shortname = item.get('shortname') or item.get('longname') or symbol
                 exchange = item.get('exchDisp') or item.get('exchange', '')
 
-                # Market Filtering
                 if market == "NSE" and not (symbol.endswith('.NS') or exchange.upper() == 'NSE'): continue
                 elif market == "BSE" and not (symbol.endswith('.BO') or exchange.upper() == 'BSE'): continue
                 elif market == "US" and not (exchange.upper() in ['NASDAQ', 'NYSE', 'NYQ', 'NYS', 'NCM', 'NGS'] or ('.' not in symbol and not symbol.endswith('.NS') and not symbol.endswith('.BO'))): continue
@@ -235,10 +240,21 @@ class DataEngine:
                 info['currency'] = getattr(fast, 'currency', info.get('currency', 'INR'))
         except: pass 
 
-        if df is None or df.empty:
-            df, info, symbol_clean = cls.direct_api_fallback(symbol_clean, fetch_period)
+        # FORCE FALLBACK IF CRITICAL FUNDAMENTALS ARE MISSING
+        needs_fallback = df is None or df.empty or not info.get('marketCap') or not info.get('revenueGrowth')
+        
+        if needs_fallback:
+            fallback_df, fallback_info, symbol_clean = cls.direct_api_fallback(symbol_clean, fetch_period)
+            
+            if df is None or df.empty:
+                df = fallback_df
+                
+            # Carefully merge fallback fundamentals without overwriting good data
+            for k, v in fallback_info.items():
+                if not info.get(k) or info.get(k) in ["N/A", "—", 0, 0.0]:
+                    info[k] = v
 
-        if df.empty: raise ValueError(f"Ticker '{symbol}' not found or blocked. Please check spelling.")
+        if df is None or df.empty: raise ValueError(f"Ticker '{symbol}' not found or blocked. Please check spelling.")
 
         df.index = pd.to_datetime(df.index)
         if df.index.tz is not None: df.index = df.index.tz_localize(None)
@@ -250,7 +266,7 @@ class DataEngine:
         df = df.ffill().bfill()
         if 'currentPrice' not in info or not info['currentPrice']: info['currentPrice'] = df['Close'].iloc[-1]
         
-        # Fallback Calculation for Market Cap if missing
+        # Mathematical safety net for Market Cap
         if not info.get('marketCap') and info.get('sharesOutstanding'):
             info['marketCap'] = info['currentPrice'] * info['sharesOutstanding']
 
