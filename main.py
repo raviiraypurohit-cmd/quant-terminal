@@ -1,8 +1,8 @@
 # ==============================================================================
-# 📈 INSTITUTIONAL QUANTITATIVE TRADING TERMINAL v9.1 (Cloud Edition)
+# 📈 INSTITUTIONAL QUANTITATIVE TRADING TERMINAL v10.0 (Cloud Edition)
 # Author: Ravi Ray Purohit
-# Features: Dynamic Search, Exchange Filter, Lightweight Live Charts, 
-#           Force Fundamental Fallback, Currency Auto-Detect
+# Features: TLS Spoofing (Anti-Bot Bypass), Dynamic Search, Exchange Filter, 
+#           Lightweight Live Charts, No N/A Fallbacks, Currency Auto-Detect
 # ==============================================================================
 
 import sys
@@ -63,25 +63,33 @@ class Utils:
         except: return str(val) if val else "—"
 
 # ==============================================================================
-# DATA ENGINE
+# DATA ENGINE (WITH TLS SPOOFING)
 # ==============================================================================
 class DataEngine:
     _cache = {}
 
     @classmethod
+    def get_spoofed_session(cls):
+        """Uses curl_cffi to mimic the JA3/JA4 TLS handshake of a real Chrome browser."""
+        try:
+            from curl_cffi import requests as spoof_req
+            return spoof_req.Session(impersonate="chrome120")
+        except ImportError:
+            # Fallback to standard requests if curl-cffi isn't installed (will likely be blocked by Yahoo on Render)
+            import requests as std_req
+            session = std_req.Session()
+            session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"})
+            return session
+
+    @classmethod
     def get_session_and_crumb(cls, symbol):
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        })
+        session = cls.get_spoofed_session()
         crumb = ""
         try:
-            try: session.get("https://fc.yahoo.com", timeout=3)
-            except: session.get(f"https://finance.yahoo.com/quote/{symbol}", timeout=3)
+            try: session.get("https://fc.yahoo.com", timeout=5)
+            except: session.get(f"https://finance.yahoo.com/quote/{symbol}", timeout=5)
             
-            res = session.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=3)
+            res = session.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=5)
             if res.status_code == 200: crumb = res.text.strip()
         except: pass
         return session, crumb
@@ -89,11 +97,10 @@ class DataEngine:
     @classmethod
     def search_symbols(cls, query, market="ALL"):
         if not query or len(query) < 2: return []
-        session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        session = cls.get_spoofed_session()
         url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}&quotesCount=15&newsCount=0&listsCount=0"
         try:
-            res = session.get(url, timeout=4)
+            res = session.get(url, timeout=5)
             if res.status_code != 200: return []
             quotes = res.json().get('quotes', [])
             results = []
@@ -121,7 +128,7 @@ class DataEngine:
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=5m"
         if crumb: url += f"&crumb={crumb}"
         try:
-            res = session.get(url, timeout=4)
+            res = session.get(url, timeout=5)
             if res.status_code != 200: return []
             data = res.json()['chart']['result'][0]
             timestamps = data.get('timestamp', [])
@@ -148,14 +155,14 @@ class DataEngine:
         
         chart_url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range={period}&interval=1d"
         if crumb: chart_url += f"&crumb={crumb}"
-        res = session.get(chart_url)
+        res = session.get(chart_url, timeout=5)
         
         if res.status_code != 200 or not res.json().get('chart', {}).get('result'):
             if not symbol.endswith('.NS'):
                 symbol = f"{symbol}.NS"
                 chart_url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range={period}&interval=1d"
                 if crumb: chart_url += f"&crumb={crumb}"
-                res = session.get(chart_url)
+                res = session.get(chart_url, timeout=5)
                 if res.status_code != 200: return pd.DataFrame(), {}, symbol
             else: return pd.DataFrame(), {}, symbol
                 
@@ -176,7 +183,7 @@ class DataEngine:
         try:
             quote_url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
             if crumb: quote_url += f"&crumb={crumb}"
-            q_res = session.get(quote_url).json()['quoteResponse']['result'][0]
+            q_res = session.get(quote_url, timeout=5).json()['quoteResponse']['result'][0]
             info.update({
                 'longName': q_res.get('longName', symbol), 'exchange': q_res.get('fullExchangeName', 'NSE'),
                 'marketCap': q_res.get('marketCap', 0), 'fiftyTwoWeekHigh': q_res.get('fiftyTwoWeekHigh', 0),
@@ -187,18 +194,21 @@ class DataEngine:
         except: pass
             
         try:
-            summary_url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=financialData,defaultKeyStatistics,majorHoldersBreakdown"
+            summary_url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=financialData,defaultKeyStatistics,majorHoldersBreakdown,summaryDetail"
             if crumb: summary_url += f"&crumb={crumb}"
-            sum_res = session.get(summary_url).json()['quoteSummary']['result'][0]
+            sum_res = session.get(summary_url, timeout=5).json()['quoteSummary']['result'][0]
             
             fd = sum_res.get('financialData', {})
+            sd = sum_res.get('summaryDetail', {})
             info.update({
                 'revenueGrowth': fd.get('revenueGrowth', {}).get('raw', None),
                 'earningsGrowth': fd.get('earningsGrowth', {}).get('raw', None),
                 'returnOnEquity': fd.get('returnOnEquity', {}).get('raw', None),
                 'debtToEquity': fd.get('debtToEquity', {}).get('raw', None),
                 'targetMeanPrice': fd.get('targetMeanPrice', {}).get('raw', None),
-                'recommendationKey': fd.get('recommendationKey', 'N/A')
+                'recommendationKey': fd.get('recommendationKey', 'N/A'),
+                'marketCap': sd.get('marketCap', {}).get('raw', info.get('marketCap')),
+                'dividendYield': sd.get('dividendYield', {}).get('raw', info.get('dividendYield'))
             })
             mhb = sum_res.get('majorHoldersBreakdown', {})
             info['heldPercentInsiders'] = mhb.get('insidersPercentHeld', {}).get('raw', None)
@@ -220,6 +230,7 @@ class DataEngine:
         df = pd.DataFrame()
         info = {}
 
+        # 1. Attempt Standard YFinance
         try:
             session = requests.Session()
             session.headers.update({"User-Agent": "Mozilla/5.0"})
@@ -240,7 +251,7 @@ class DataEngine:
                 info['currency'] = getattr(fast, 'currency', info.get('currency', 'INR'))
         except: pass 
 
-        # FORCE FALLBACK IF CRITICAL FUNDAMENTALS ARE MISSING
+        # 2. Check if YFinance failed to grab deep fundamentals, trigger TLS Spoofing Scraper
         needs_fallback = df is None or df.empty or not info.get('marketCap') or not info.get('revenueGrowth')
         
         if needs_fallback:
@@ -249,7 +260,7 @@ class DataEngine:
             if df is None or df.empty:
                 df = fallback_df
                 
-            # Carefully merge fallback fundamentals without overwriting good data
+            # Safely merge deep data without erasing good data
             for k, v in fallback_info.items():
                 if not info.get(k) or info.get(k) in ["N/A", "—", 0, 0.0]:
                     info[k] = v
@@ -266,7 +277,7 @@ class DataEngine:
         df = df.ffill().bfill()
         if 'currentPrice' not in info or not info['currentPrice']: info['currentPrice'] = df['Close'].iloc[-1]
         
-        # Mathematical safety net for Market Cap
+        # 3. Final mathematical safety net for Market Cap
         if not info.get('marketCap') and info.get('sharesOutstanding'):
             info['marketCap'] = info['currentPrice'] * info['sharesOutstanding']
 
@@ -627,7 +638,7 @@ class UIEngine:
 
                 document.addEventListener('DOMContentLoaded', initLightweightChart);
                 window.addEventListener('themeChanged', initLightweightChart);
-                setInterval(loadIntradayData, 8000); // Live poll every 8 seconds
+                setInterval(loadIntradayData, 8000); 
                 window.addEventListener('resize', () => {{
                     if(chart) chart.applyOptions({{ width: document.getElementById('lightweight_chart').clientWidth }});
                 }});
@@ -646,7 +657,7 @@ class UIEngine:
             <div class="header-bar">
                 <div>
                     <h1 class="ticker-title">{info.get('longName', symbol)} ({symbol})</h1>
-                    <span style="color:var(--text-muted); font-size:12px;">{info.get('exchange', 'NSE')} | {info.get('sector', 'N/A')}</span>
+                    <span style="color:var(--text-muted); font-size:12px;">{info.get('exchange', 'NSE')} | {info.get('sector', '—')}</span>
                 </div>
                 <div style="text-align: right;">
                     <div style="font-size: 28px; font-weight: 700;">{Utils.fmt(curr_price, curr_code=curr_code)}</div>
@@ -762,7 +773,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         path = parsed_url.path
         query_params = parse_qs(parsed_url.query)
 
-        # 1. API SEARCH ROUTE
         if path == "/api/search":
             q = query_params.get('q', [''])[0].strip()
             market = query_params.get('market', ['ALL'])[0].strip()
@@ -774,7 +784,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps(results).encode("utf-8"))
             return
 
-        # 2. API INTRADAY CHART ROUTE
         elif path == "/api/intraday":
             symbol = query_params.get('symbol', [''])[0].strip()
             candles = DataEngine.fetch_intraday(symbol)
@@ -785,7 +794,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps(candles).encode("utf-8"))
             return
 
-        # 3. HTML DASHBOARD PAGE
         elif path == "/" or path == "/index.html":
             ticker = query_params.get('ticker', [''])[0].strip().upper()
             tf = query_params.get('tf', ['1y'])[0]
